@@ -92,5 +92,25 @@ tool("pty_kill", {"session_id": sid2})
 print("=== pty_list ===")
 print(tool("pty_list", {}))
 
+# 6) settle timing: a quick echo must settle early, not burn the 1500ms cap
+print("=== settle timing: quick echo ===")
+t0 = time.time()
+out = tool("pty_spawn", {"command": "echo timing-test", "cols": 100, "rows": 20})
+elapsed = time.time() - t0
+assert "timing-test" in out, f"echo output missing: {out!r}"
+assert elapsed < 1.2, f"settle too slow: {elapsed:.2f}s (expected < 1.2s)"
+print(f"---- spawn returned in {elapsed*1000:.0f}ms")
+
+# 7) strip_ansi: 3-byte ESC sequences (e.g. ESC ( 0 charset switch) must not
+#    leave their final byte behind
+print("=== strip_ansi: 3-byte charset switch ===")
+out = tool("pty_spawn", {"command": "printf '\\033(0ab\\033(Bc\\n'", "cols": 100, "rows": 20})
+sid_ansi = out.split("session_id=")[1].split("\n")[0].strip()
+out = tool("pty_tail", {"session_id": sid_ansi, "max_bytes": 8000})
+assert "abc" in out, f"stripped output missing 'abc': {out!r}"
+assert "0abc" not in out, f"3-byte ESC sequence left residue '0abc': {out!r}"
+print(out[:400])
+tool("pty_kill", {"session_id": sid_ansi})
+
 proc.terminate()
 print("ALL OK")

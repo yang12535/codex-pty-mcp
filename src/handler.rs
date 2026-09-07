@@ -15,6 +15,7 @@ use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ServerCapabilities;
 use rmcp::model::ServerInfo;
 use rmcp::model::Tool;
+use rmcp::model::ToolAnnotations;
 use rmcp::service::RequestContext;
 use rmcp::service::RoleServer;
 use serde::Deserialize;
@@ -51,6 +52,18 @@ impl PtyMcpServer {
             Cow::Owned(description.to_string()),
             Arc::new(schema),
         )
+    }
+
+    /// Same as `tool` but marked read-only for MCP clients.
+    fn readonly_tool(
+        name: &str,
+        description: &str,
+        schema: serde_json::Value,
+        required: &[&str],
+    ) -> Tool {
+        let mut tool = Self::tool(name, description, schema, required);
+        tool.annotations = Some(ToolAnnotations::new().read_only(true));
+        tool
     }
 }
 
@@ -128,7 +141,10 @@ fn ctrl_bytes(key: &str) -> Option<Vec<u8>> {
 
 fn header(s: &crate::session::Session) -> String {
     let exited = if s.handle.has_exited() {
-        format!("exited (code={:?})", s.handle.exit_code())
+        match s.handle.exit_code() {
+            Some(code) => format!("exited (code={code})"),
+            None => "exited".to_string(),
+        }
     } else {
         "running".to_string()
     };
@@ -211,7 +227,7 @@ impl ServerHandler for PtyMcpServer {
                 }),
                 &["session_id", "key"],
             ),
-            Self::tool(
+            Self::readonly_tool(
                 "pty_screen",
                 "Read the current rendered screen (tmux capture-pane style plain text) of a session.",
                 json!({
@@ -222,7 +238,7 @@ impl ServerHandler for PtyMcpServer {
                 }),
                 &["session_id"],
             ),
-            Self::tool(
+            Self::readonly_tool(
                 "pty_tail",
                 "Read the last N bytes of raw output with ANSI escapes stripped. \
                  Best for normal (non-TUI) command output, scrollback, and anything \
@@ -249,7 +265,7 @@ impl ServerHandler for PtyMcpServer {
                 }),
                 &["session_id", "cols", "rows"],
             ),
-            Self::tool(
+            Self::readonly_tool(
                 "pty_list",
                 "List all PTY sessions with their command, size and exit status.",
                 obj.clone(),

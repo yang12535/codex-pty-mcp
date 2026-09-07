@@ -15,9 +15,23 @@ use crate::pty;
 
 /// Bytes of raw output kept per session for tail reads.
 pub const TAIL_CAP: usize = 64 * 1024;
+/// Maximum live sessions; a full table evicts exited sessions before failing.
+const MAX_SESSIONS: usize = 64;
 /// Initial quiet window before returning output after a spawn/send.
 const QUIET_MS: u64 = 300;
 const POLL_MS: u64 = 100;
+
+/// Expand a lone `~` or a `~/`-prefixed path to $HOME; leave the path
+/// untouched when HOME is unset.
+fn expand_home(path: &str) -> String {
+    if path != "~" && !path.starts_with("~/") {
+        return path.to_string();
+    }
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => format!("{home}{}", &path[1..]),
+        _ => path.to_string(),
+    }
+}
 
 pub struct Session {
     pub id: String,
@@ -52,16 +66,20 @@ impl Session {
     /// Render the current emulated screen as plain text (tmux capture-pane
     /// style, colors dropped).
     pub fn screen_text(&self) -> String {
-        let parser = self.screen.lock().expect("vt100 parser lock");
-        parser.screen().contents()
+        if let Ok(parser) = self.screen.lock() {
+            return parser.screen().contents();
+        }
+        String::new()
     }
 
     /// Last `max` bytes of raw output with ANSI escape sequences stripped.
     pub fn tail_text(&self, max: usize) -> String {
-        let bytes: Vec<u8> = {
-            let tail = self.tail.lock().expect("tail lock");
-            let start = tail.len().saturating_sub(max);
-            tail.iter().skip(start).copied().collect()
+        let bytes: Vec<u8> = match self.tail.lock() {
+            Ok(tail) => {
+                let start = tail.len().saturating_sub(max);
+                tail.iter().skip(start).copied().collect()
+            }
+            Err(_) => Vec::new(),
         };
         strip_ansi(&bytes)
     }
@@ -78,8 +96,8 @@ impl Session {
     }
 }
 
-/// Wait until output goes quiet (no new bytes for QUIET_MS), the process
-/// exits, or the overall deadline expires.
+/// Wait until output goes quiet (no new bytes for QUIET_MS), the process has
+/// exited with its output drained, or the overall deadline expires.
 pub async fn settle(session: &Session, wait_ms: u64) {
     let deadline = Instant::now() + Duration::from_millis(wait_ms.max(QUIET_MS * 2));
     let mut last_total = session.total_bytes();
@@ -90,14 +108,15 @@ pub async fn settle(session: &Session, wait_ms: u64) {
         if now != last_total {
             last_total = now;
             last_change = Instant::now();
-        } else if last_change.elapsed() >= Duration::from_millis(QUIET_MS)
-            && session.handle.has_exited()
-        {
-            return;
-        } else if last_change.elapsed() >= Duration::from_millis(QUIET_MS)
-            && Instant::now() >= deadline
-        {
-            return;
+        } else {
+            // No new bytes this poll cycle: an exited process has drained,
+            // and a quiet one has settled.
+            if session.handle.has_exited() {
+                return;
+            }
+            if last_change.elapsed() >= Duration::from_millis(QUIET_MS) {
+                return;
+            }
         }
         if Instant::now() >= deadline {
             return;
@@ -122,8 +141,27 @@ impl SessionManager {
         rows: u16,
     ) -> Result<std::sync::Arc<Session>> {
         let id = format!("pty-{}", self.counter.fetch_add(1, Ordering::SeqCst) + 1);
+        // Enforce the session cap: evict exited sessions when full, fail only
+        // if every slot is held by a running process.
+        if let Ok(mut sessions) = self.sessions.lock() {
+            if sessions.len() >= MAX_SESSIONS {
+                let dead: Vec<String> = sessions
+                    .iter()
+                    .filter(|(_, session)| session.handle.has_exited())
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in dead {
+                    if let Some(session) = sessions.remove(&id) {
+                        session.handle.terminate();
+                    }
+                }
+                if sessions.len() >= MAX_SESSIONS {
+                    anyhow::bail!("too many sessions (max 64)");
+                }
+            }
+        }
         let dir = cwd
-            .map(PathBuf::from)
+            .map(|cwd| PathBuf::from(expand_home(&cwd)))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
         let (program, args): (&str, Vec<String>) = match command {
             Some(ref cmd) if !cmd.trim().is_empty() => ("bash", vec!["-lc".into(), cmd.clone()]),
@@ -233,6 +271,12 @@ fn strip_ansi(input: &[u8]) -> String {
                         j += 1;
                     }
                     i = j;
+                    continue;
+                }
+                0x20..=0x2f => {
+                    // ESC + intermediate byte (0x20..=0x2f) + final byte, e.g.
+                    // `ESC ( 0` selects the DEC line-drawing charset.
+                    i = (i + 3).min(input.len());
                     continue;
                 }
                 _ => {
