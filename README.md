@@ -1,41 +1,49 @@
 # codex-pty-mcp
 
-Give your AI agent a **real pseudo-terminal** over MCP: run `htop`, `vim`,
-REPLs, interactive installers, `sudo` prompts — anything that needs a TTY —
-and read the screen as plain text.
+[English](README_EN.md) | 中文
 
-The PTY/process layer is **vendored verbatim from
-[openai/codex](https://github.com/openai/codex)** (`codex-rs/utils/pty`,
-Apache-2.0) — the same battle-tested code Codex CLI uses in production.
-On top of it sits a thin MCP service layer (the official
-[rmcp](https://github.com/modelcontextprotocol/rust-sdk) SDK, the same one
-codex uses) plus a `vt100` screen emulator that renders TUI output into
-readable text, like `tmux capture-pane -p`.
+给你的 AI Agent 一个**真·伪终端（PTY）**：跑 `htop`、`vim`、REPL、交互式安装器、
+`sudo` 密码提示——一切需要 TTY 的程序，并把终端画面渲染成纯文本读回来。
+
+PTY/进程层**逐字节提取自 [openai/codex](https://github.com/openai/codex)**
+（`codex-rs/utils/pty`，Apache-2.0）——也就是 Codex CLI 生产环境在用的那套
+久经考验的代码。上面套了一层薄的 MCP 服务层（用的是 codex 同款官方
+[rmcp](https://github.com/modelcontextprotocol/rust-sdk) SDK），再加一个
+`vt100` 屏幕仿真器，把 TUI 画面转成可读文本，效果类似 `tmux capture-pane -p`。
 
 ```
 ┌─────────────────────────────────────────────┐
-│ MCP client (ZCode / Claude / any agent)     │
+│ MCP 客户端（ZCode / Claude / 任意 Agent）    │
 └──────────────────┬──────────────────────────┘
-        stdio JSON-RPC (rmcp 3.2)
+        stdio JSON-RPC（rmcp 3.2）
 ┌──────────────────┴──────────────────────────┐
-│ glue layer: 8 pty_* tools, session manager  │
-│ vt100 screen emulation + ANSI-stripped tail │
+│ 胶水层：8 个 pty_* 工具、会话管理            │
+│ vt100 屏幕仿真 + ANSI 剥离的尾部输出         │
 ├─────────────────────────────────────────────┤
-│ codex-utils-pty (vendored from openai/codex)│
-│ portable-pty · process groups · async IO    │
+│ codex-utils-pty（提取自 openai/codex）       │
+│ portable-pty · 进程组管理 · 异步 I/O         │
 └─────────────────────────────────────────────┘
 ```
 
-## Build
+## 为什么是提取 codex
+
+PTY 这东西的难点全在细节：进程组硬杀、PTY 关闭时的 EIO/EOF 区分、stdin
+关闭的 VEOF 序列、exec 前的 fd 清扫……这些坑 codex 的海量用户都替我们踩平了。
+自己写等于重踩一年，用零星小项目等于替作者踩。本仓库把这些生产级代码原样
+搬来（文件与上游保持逐字节一致，见
+[src/codex_pty/VENDORED.md](src/codex_pty/VENDORED.md)），自己只写了一小层
+胶水——需要验证的面积非常小。
+
+## 构建
 
 ```sh
 cargo build --release
-# binary: target/release/codex-pty-mcp
+# 产物：target/release/codex-pty-mcp
 ```
 
-## Register with your MCP client
+## 注册到 MCP 客户端
 
-ZCode (`~/.zcode/cli/config.json`):
+ZCode（`~/.zcode/cli/config.json`）：
 
 ```json
 {
@@ -50,7 +58,7 @@ ZCode (`~/.zcode/cli/config.json`):
 }
 ```
 
-Generic clients (Claude-style `mcpServers`):
+通用客户端（Claude 风格 `mcpServers`）：
 
 ```json
 {
@@ -62,41 +70,40 @@ Generic clients (Claude-style `mcpServers`):
 }
 ```
 
-Restart your client so the server connects at session start.
+注册后重启客户端，MCP server 在会话启动时自动连接。
 
-## Tools
+## 工具一览
 
-| Tool | Purpose |
+| 工具 | 用途 |
 |---|---|
-| `pty_spawn` | Spawn a command (`bash -lc <command>`) or an interactive login shell in a new PTY; returns the rendered screen |
-| `pty_send` | Type text (optional Enter), wait for output to settle, return the screen |
-| `pty_ctrl` | Send a special key: `c-c`, `c-d`, `enter`, `esc`, `up/down/left/right`, `pageup/pagedown`, … |
-| `pty_screen` | Read the current rendered screen (plain text, tmux capture-pane style) |
-| `pty_tail` | Read the last N bytes of raw output with ANSI escapes stripped (best for non-TUI commands, UTF-8 preserved) |
-| `pty_resize` | Resize the PTY in character cells |
-| `pty_list` | List sessions with command, size, exit status |
-| `pty_kill` | Kill the session's process group and drop it |
+| `pty_spawn` | 在新 PTY 会话里启动命令（`bash -lc <command>`）或交互式登录 shell；返回渲染后的屏幕 |
+| `pty_send` | 输入文本（可选回车），等输出稳定后返回屏幕 |
+| `pty_ctrl` | 发送特殊键：`c-c`、`c-d`、`enter`、`esc`、`up/down/left/right`、`pageup/pagedown` 等 |
+| `pty_screen` | 读取当前渲染屏幕（纯文本，类似 tmux capture-pane） |
+| `pty_tail` | 读取最近 N 字节原始输出并剥离 ANSI 转义（适合非 TUI 命令，UTF-8 完好） |
+| `pty_resize` | 按字符格数调整终端尺寸 |
+| `pty_list` | 列出所有会话的命令、尺寸、退出状态 |
+| `pty_kill` | 杀掉会话的整个进程组并移除会话 |
 
-Rules of thumb: TUI apps → read `pty_screen`; plain commands / long output →
-`pty_tail`. Sessions stay alive across tool calls, so you can spawn a REPL
-once and keep typing into it.
+经验法则：TUI 程序 → 读 `pty_screen`；普通命令 / 长输出 → `pty_tail`。
+会话跨工具调用持续存活，可以先起一个 REPL 然后反复往里输入。
 
-## Testing
+## 测试
 
-`scripts/test_pty_mcp.py` speaks raw MCP JSON-RPC over stdio — spawns `htop`,
-screenshots the rendered display, quits it, drives a Python REPL, and asserts
-exit codes. Good smoke test after any change:
+`scripts/test_pty_mcp.py` 直接在 stdio 上说 MCP JSON-RPC：启动 `htop`、
+截取渲染画面、退出它、驱动一个 Python REPL 并断言退出码。任何改动之后
+跑一遍就是冒烟回归：
 
 ```sh
 python3 scripts/test_pty_mcp.py
 ```
 
-## License
+## 许可证
 
-Apache-2.0 (see [LICENSE](LICENSE)). The vendored codex files under
-`src/codex_pty/` keep their upstream provenance in
-[src/codex_pty/VENDORED.md](src/codex_pty/VENDORED.md); see also
-[NOTICE.md](NOTICE.md).
+Apache-2.0（见 [LICENSE](LICENSE)）。`src/codex_pty/` 下的 codex 提取文件
+保留上游出处（[VENDORED.md](src/codex_pty/VENDORED.md)、
+[LICENSE.upstream](src/codex_pty/LICENSE.upstream)），另见
+[NOTICE.md](NOTICE.md)。
 
-Not affiliated with OpenAI. This is an independent extraction for personal
-tooling; all credit for the hard PTY parts belongs to the codex authors.
+与 OpenAI 无隶属关系。这是一个独立的个人工具向提取；PTY 层的全部功劳
+属于 codex 的作者们。
