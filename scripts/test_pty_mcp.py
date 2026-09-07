@@ -54,6 +54,11 @@ send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 # tools/list
 i = call("tools/list", {})
 tl = recv(i)
+# ZCode's client requires the SEP-2549 cache hint on tools/list results.
+assert tl["result"].get("cacheScope") in ("public", "private"), \
+    f"missing/invalid cacheScope: {tl['result'].get('cacheScope')!r}"
+assert isinstance(tl["result"].get("ttlMs"), int) and tl["result"]["ttlMs"] >= 0, \
+    f"missing/invalid ttlMs: {tl['result'].get('ttlMs')!r}"
 print("== tools:", [t["name"] for t in tl["result"]["tools"]])
 
 # 1) plain command + tail

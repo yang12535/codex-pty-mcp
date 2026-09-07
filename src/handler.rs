@@ -7,7 +7,8 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResponse;
-use rmcp::model::CallToolResult;use rmcp::model::ContentBlock;
+use rmcp::model::CallToolResult;
+use rmcp::model::CacheScope;use rmcp::model::ContentBlock;
 use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
 use rmcp::model::PaginatedRequestParams;
@@ -266,7 +267,13 @@ impl ServerHandler for PtyMcpServer {
                 &["session_id"],
             ),
         ];
-        Ok(ListToolsResult::with_all_items(tools))
+        let mut result = ListToolsResult::with_all_items(tools);
+        // ZCode's MCP client validates tools/list against its SEP-2549
+        // extended schema and requires the cache hint: ttlMs int >= 0 and
+        // cacheScope "public" | "private". 0/private = always fetch fresh.
+        result.ttl_ms = Some(0);
+        result.cache_scope = Some(CacheScope::Private);
+        Ok(result)
     }
 
     async fn call_tool(
