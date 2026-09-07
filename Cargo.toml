@@ -1,0 +1,31 @@
+[package]
+name = "codex-pty-mcp"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Interactive PTY session MCP server; PTY layer extracted from openai/codex codex-utils-pty"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+portable-pty = "0.9"
+rmcp = { version = "=3.2.0", default-features = false, features = [
+    "server",
+    "transport-async-rw",
+    "transport-io",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+vt100 = "0.16"
+
+[profile.release]
+strip = true
