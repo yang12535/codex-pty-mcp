@@ -4,10 +4,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
 use crate::process::{ProcessHandle, TerminalSize};
@@ -41,9 +43,19 @@ pub struct Session {
     screen: StdMutex<vt100::Parser>,
     tail: StdMutex<VecDeque<u8>>,
     total: AtomicU64,
+    /// Set by the pump task when the PTY reader reaches EOF: the whole
+    /// process tree is gone and no more output can arrive.
+    eof: AtomicBool,
+    /// Held for the session's lifetime to bound concurrent process creation.
+    _permit: OwnedSemaphorePermit,
 }
 
 impl Session {
+    /// True once the PTY reader hit EOF (pump drained and stopped).
+    pub fn is_eof(&self) -> bool {
+        self.eof.load(Ordering::SeqCst)
+    }
+
     fn feed(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -118,10 +130,20 @@ pub async fn settle(session: &Session, wait_ms: u64) {
     }
 }
 
-#[derive(Default)]
 pub struct SessionManager {
     sessions: StdMutex<HashMap<String, std::sync::Arc<Session>>>,
     counter: AtomicU64,
+    permits: std::sync::Arc<Semaphore>,
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self {
+            sessions: StdMutex::new(HashMap::new()),
+            counter: AtomicU64::new(0),
+            permits: std::sync::Arc::new(Semaphore::new(MAX_SESSIONS)),
+        }
+    }
 }
 
 impl SessionManager {
@@ -135,6 +157,31 @@ impl SessionManager {
         rows: u16,
     ) -> Result<std::sync::Arc<Session>> {
         let id = format!("pty-{}", self.counter.fetch_add(1, Ordering::SeqCst) + 1);
+        // Reap sessions that are fully gone (exited AND PTY at EOF) to free
+        // their slots. has_exited alone is not enough: background
+        // descendants can still own the PTY and write after bash exits.
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dead: Vec<String> = sessions
+                .iter()
+                .filter(|(_, session)| session.handle.has_exited() && session.is_eof())
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in dead {
+                if let Some(session) = sessions.remove(&id) {
+                    session.handle.terminate();
+                }
+            }
+        }
+        // Bound concurrent process creation, not just the table size: a
+        // spawn burst must not launch processes only to kill them after.
+        // The permit is released when the Session (and its pump) is dropped.
+        let permit = std::sync::Arc::clone(&self.permits)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("too many sessions (max {MAX_SESSIONS})"))?;
         let dir = cwd
             .map(|cwd| PathBuf::from(expand_home(&cwd)))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
@@ -170,6 +217,8 @@ impl SessionManager {
             screen: StdMutex::new(vt100::Parser::new(rows, cols, 1000)),
             tail: StdMutex::new(VecDeque::with_capacity(4096)),
             total: AtomicU64::new(0),
+            eof: AtomicBool::new(false),
+            _permit: permit,
         });
 
         // Pump PTY output into the emulator + tail for as long as it flows.
@@ -179,33 +228,14 @@ impl SessionManager {
             while let Some(chunk) = stdout_rx.recv().await {
                 pump_session.feed(&chunk);
             }
+            pump_session.eof.store(true, Ordering::SeqCst);
         });
 
-        // The cap check, eviction and insert must happen under one guard:
-        // concurrent spawns otherwise each pass a detached pre-check and
-        // exceed MAX_SESSIONS. Recover a poisoned lock so the cap still
-        // applies; the guard is dropped before returning, never held across
-        // an await.
+        // A permit is held, so a slot is guaranteed; insertion never fails.
         let mut sessions = self
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if sessions.len() >= MAX_SESSIONS {
-            let dead: Vec<String> = sessions
-                .iter()
-                .filter(|(_, session)| session.handle.has_exited())
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in dead {
-                if let Some(session) = sessions.remove(&id) {
-                    session.handle.terminate();
-                }
-            }
-            if sessions.len() >= MAX_SESSIONS {
-                session.handle.terminate();
-                anyhow::bail!("too many sessions (max {MAX_SESSIONS})");
-            }
-        }
         sessions.insert(id, std::sync::Arc::clone(&session));
         drop(sessions);
         Ok(session)
@@ -273,9 +303,19 @@ fn strip_ansi(input: &[u8]) -> String {
                     continue;
                 }
                 0x20..=0x2f => {
-                    // ESC + intermediate byte (0x20..=0x2f) + final byte, e.g.
-                    // `ESC ( 0` selects the DEC line-drawing charset.
-                    i = (i + 3).min(input.len());
+                    // ESC + intermediate bytes (0x20..=0x2f) + one final
+                    // byte (0x30..=0x7e), e.g. `ESC ( 0` selects the DEC
+                    // line-drawing charset. Only consume bytes that match
+                    // the grammar: a truncated/malformed sequence must not
+                    // eat a payload byte (newline, UTF-8 lead, ...).
+                    let mut j = i + 1;
+                    while j < input.len() && (0x20..=0x2f).contains(&input[j]) {
+                        j += 1;
+                    }
+                    if j < input.len() && (0x30..=0x7e).contains(&input[j]) {
+                        j += 1;
+                    }
+                    i = j;
                     continue;
                 }
                 _ => {

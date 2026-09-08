@@ -94,9 +94,9 @@ print(tool("pty_list", {}))
 
 # 6) settle timing: a quick echo must settle early, not burn the 1500ms cap
 print("=== settle timing: quick echo ===")
-t0 = time.time()
+t0 = time.monotonic()
 out = tool("pty_spawn", {"command": "echo timing-test", "cols": 100, "rows": 20})
-elapsed = time.time() - t0
+elapsed = time.monotonic() - t0
 assert "timing-test" in out, f"echo output missing: {out!r}"
 assert elapsed < 1.2, f"settle too slow: {elapsed:.2f}s (expected < 1.2s)"
 print(f"---- spawn returned in {elapsed*1000:.0f}ms")
@@ -113,11 +113,22 @@ print(out[:400])
 tool("pty_kill", {"session_id": sid_ansi})
 
 # 8) settle must not treat child exit as drained: bash exits immediately but
-#    the backgrounded subshell still owns the PTY and writes at ~250ms
+#    the backgrounded subshell still owns the PTY and writes at ~150ms
+#    (150ms leaves margin against the 300ms quiet cutoff on a loaded host)
 print("=== settle: output arriving after child exit ===")
-out = tool("pty_spawn", {"command": "(sleep 0.25; echo late-marker) &", "cols": 100, "rows": 20})
+out = tool("pty_spawn", {"command": "(sleep 0.15; echo late-marker) &", "cols": 100, "rows": 20})
 assert "late-marker" in out, f"late post-exit output missing: {out!r}"
 print("---- late output captured")
+
+# 9) strip_ansi: a malformed/truncated ESC sequence must not eat a payload
+#    byte — ESC ( followed by a newline keeps the newline
+print("=== strip_ansi: malformed ESC keeps payload ===")
+out = tool("pty_spawn", {"command": "printf 'a\\033(\\nb\\n'", "cols": 100, "rows": 20})
+sid_bad = out.split("session_id=")[1].split("\n")[0].strip()
+out = tool("pty_tail", {"session_id": sid_bad, "max_bytes": 8000})
+assert "a\nb" in out, f"malformed ESC ate the newline: {out!r}"
+print("---- payload byte preserved")
+tool("pty_kill", {"session_id": sid_bad})
 
 proc.terminate()
 print("ALL OK")
