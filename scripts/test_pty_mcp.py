@@ -34,6 +34,17 @@ def result_text(response):
                      if c.get("type") == "text")
 
 
+def wait_for_completed_output(client, out, expected, timeout=10):
+    """Capacity tests allow startup past the quiet window under CPU load."""
+    sid = session_id(out)
+    deadline = time.monotonic() + timeout
+    while "exited (code=0)" not in out.splitlines()[0] or expected not in payload(out):
+        assert time.monotonic() < deadline, out
+        time.sleep(0.05)
+        out = client.tool("pty_screen", {"session_id": sid})
+    return out
+
+
 class Client:
     def __init__(self, binary):
         self.stderr = tempfile.TemporaryFile(mode="w+t")
@@ -205,11 +216,25 @@ def run(client):
     listing = client.tool("pty_list", {})
     assert len(re.findall(r"^\[pty-\d+\]", listing, re.MULTILINE)) == 64, listing
     client.tool("pty_kill", {"session_id": accepted[0]})
+    # Allocation must succeed immediately after kill; output can arrive
+    # later when the runner is still scheduling the concurrent startup burst.
     replacement = client.tool("pty_spawn", {"command": "echo replacement"})
-    assert "replacement" in payload(replacement), replacement
+    wait_for_completed_output(client, replacement, "replacement")
     # At capacity, only the completed replacement is eligible for eviction.
-    out = client.tool("pty_spawn", {"command": "echo pressure-replacement"})
-    assert "pressure-replacement" in payload(out), out
+    # The public header reports exit, but pump EOF may follow it, so wait
+    # boundedly for eviction eligibility. Allocation after kill above never
+    # retries, and the Rust tests check the exact EOF/capacity transition.
+    deadline = time.monotonic() + 10
+    while True:
+        response = client.recv(client.call("tools/call", {
+            "name": "pty_spawn", "arguments": {"command": "echo pressure-replacement"},
+        }))
+        if "error" not in response:
+            break
+        assert "too many sessions (max 64)" in response["error"]["message"], response
+        assert time.monotonic() < deadline, response
+        time.sleep(0.05)
+    wait_for_completed_output(client, result_text(response), "pressure-replacement")
     print("PASS 80 concurrent spawns: 64 accepted, 16 rejected; kill and eviction free capacity")
 
 
