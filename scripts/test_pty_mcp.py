@@ -112,5 +112,12 @@ assert "0abc" not in out, f"3-byte ESC sequence left residue '0abc': {out!r}"
 print(out[:400])
 tool("pty_kill", {"session_id": sid_ansi})
 
+# 8) settle must not treat child exit as drained: bash exits immediately but
+#    the backgrounded subshell still owns the PTY and writes at ~250ms
+print("=== settle: output arriving after child exit ===")
+out = tool("pty_spawn", {"command": "(sleep 0.25; echo late-marker) &", "cols": 100, "rows": 20})
+assert "late-marker" in out, f"late post-exit output missing: {out!r}"
+print("---- late output captured")
+
 proc.terminate()
 print("ALL OK")

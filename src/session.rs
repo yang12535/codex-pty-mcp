@@ -96,8 +96,9 @@ impl Session {
     }
 }
 
-/// Wait until output goes quiet (no new bytes for QUIET_MS), the process has
-/// exited with its output drained, or the overall deadline expires.
+/// Wait until output goes quiet (no new bytes for QUIET_MS) or the overall
+/// deadline expires. Process exit alone is not a drain signal: descendants
+/// can still own the PTY and write after the direct child exits.
 pub async fn settle(session: &Session, wait_ms: u64) {
     let deadline = Instant::now() + Duration::from_millis(wait_ms.max(QUIET_MS * 2));
     let mut last_total = session.total_bytes();
@@ -108,15 +109,8 @@ pub async fn settle(session: &Session, wait_ms: u64) {
         if now != last_total {
             last_total = now;
             last_change = Instant::now();
-        } else {
-            // No new bytes this poll cycle: an exited process has drained,
-            // and a quiet one has settled.
-            if session.handle.has_exited() {
-                return;
-            }
-            if last_change.elapsed() >= Duration::from_millis(QUIET_MS) {
-                return;
-            }
+        } else if last_change.elapsed() >= Duration::from_millis(QUIET_MS) {
+            return;
         }
         if Instant::now() >= deadline {
             return;
@@ -141,25 +135,6 @@ impl SessionManager {
         rows: u16,
     ) -> Result<std::sync::Arc<Session>> {
         let id = format!("pty-{}", self.counter.fetch_add(1, Ordering::SeqCst) + 1);
-        // Enforce the session cap: evict exited sessions when full, fail only
-        // if every slot is held by a running process.
-        if let Ok(mut sessions) = self.sessions.lock() {
-            if sessions.len() >= MAX_SESSIONS {
-                let dead: Vec<String> = sessions
-                    .iter()
-                    .filter(|(_, session)| session.handle.has_exited())
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for id in dead {
-                    if let Some(session) = sessions.remove(&id) {
-                        session.handle.terminate();
-                    }
-                }
-                if sessions.len() >= MAX_SESSIONS {
-                    anyhow::bail!("too many sessions (max 64)");
-                }
-            }
-        }
         let dir = cwd
             .map(|cwd| PathBuf::from(expand_home(&cwd)))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
@@ -206,9 +181,33 @@ impl SessionManager {
             }
         });
 
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.insert(id, std::sync::Arc::clone(&session));
+        // The cap check, eviction and insert must happen under one guard:
+        // concurrent spawns otherwise each pass a detached pre-check and
+        // exceed MAX_SESSIONS. Recover a poisoned lock so the cap still
+        // applies; the guard is dropped before returning, never held across
+        // an await.
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sessions.len() >= MAX_SESSIONS {
+            let dead: Vec<String> = sessions
+                .iter()
+                .filter(|(_, session)| session.handle.has_exited())
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in dead {
+                if let Some(session) = sessions.remove(&id) {
+                    session.handle.terminate();
+                }
+            }
+            if sessions.len() >= MAX_SESSIONS {
+                session.handle.terminate();
+                anyhow::bail!("too many sessions (max {MAX_SESSIONS})");
+            }
         }
+        sessions.insert(id, std::sync::Arc::clone(&session));
+        drop(sessions);
         Ok(session)
     }
 
