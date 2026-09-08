@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
+use rmcp::model::CacheScope;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResponse;
 use rmcp::model::CallToolResult;
-use rmcp::model::CacheScope;use rmcp::model::ContentBlock;
+use rmcp::model::ContentBlock;
 use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
 use rmcp::model::PaginatedRequestParams;
@@ -36,16 +37,10 @@ impl PtyMcpServer {
         }
     }
 
-    fn tool(
-        name: &str,
-        description: &str,
-        schema: serde_json::Value,
-        required: &[&str],
-    ) -> Tool {
-        let mut schema: JsonObject = serde_json::from_value(schema)
-            .expect("static tool schema must be valid JSON object");
-        let required_list: Vec<serde_json::Value> =
-            required.iter().map(|r| json!(r)).collect();
+    fn tool(name: &str, description: &str, schema: serde_json::Value, required: &[&str]) -> Tool {
+        let mut schema: JsonObject =
+            serde_json::from_value(schema).expect("static tool schema must be valid JSON object");
+        let required_list: Vec<serde_json::Value> = required.iter().map(|r| json!(r)).collect();
         schema.insert("required".into(), json!(required_list));
         Tool::new(
             Cow::Owned(name.to_string()),
@@ -153,10 +148,7 @@ fn header(s: &crate::session::Session) -> String {
         .lock()
         .map(|size| format!("{}x{}", size.cols, size.rows))
         .unwrap_or_else(|_| "?x?".into());
-    format!(
-        "[{}] cmd={:?} size={} {}",
-        s.id, s.command, size, exited
-    )
+    format!("[{}] cmd={:?} size={} {}", s.id, s.command, size, exited)
 }
 
 fn internal<E: std::fmt::Display>(error: E) -> McpError {
@@ -367,7 +359,11 @@ impl ServerHandler for PtyMcpServer {
                     .get(&params.session_id)
                     .ok_or_else(|| McpError::invalid_params("unknown session_id", None))?;
                 let max = params.max_bytes.unwrap_or(8000).min(64 * 1024);
-                text_result(format!("{}\n\n{}", header(&session), session.tail_text(max)))
+                text_result(format!(
+                    "{}\n\n{}",
+                    header(&session),
+                    session.tail_text(max)
+                ))
             }
             "pty_resize" => {
                 let params: ResizeParams = serde_json::from_value(json!(args))
@@ -376,7 +372,7 @@ impl ServerHandler for PtyMcpServer {
                     .get(&params.session_id)
                     .ok_or_else(|| McpError::invalid_params("unknown session_id", None))?;
                 session.resize(params.cols, params.rows).map_err(internal)?;
-                text_result(format!("{}", header(&session)))
+                text_result(header(&session))
             }
             "pty_list" => {
                 let mut lines = vec!["id | cmd | size | status".to_string()];

@@ -85,13 +85,23 @@ once and keep typing into it.
 
 ## Testing
 
-`scripts/test_pty_mcp.py` speaks raw MCP JSON-RPC over stdio — spawns `htop`,
-screenshots the rendered display, quits it, drives a Python REPL, and asserts
-exit codes. Good smoke test after any change:
+Rust tests cover session retention, capacity release, concurrent spawns, PTY
+EOF, and escape handling. `scripts/test_pty_mcp.py` tests this checkout's
+release binary by default through MCP JSON-RPC over stdio. It checks output
+bodies, delayed output, a Python REPL, exit codes, and the 64-session cap with
+80 concurrent spawn requests. When installed, `htop` also exercises real TUI
+rendering and quit behavior.
 
 ```sh
+cargo test --locked
+cargo build --release --locked
 python3 scripts/test_pty_mcp.py
+# Or select a different binary:
+python3 scripts/test_pty_mcp.py --binary /path/to/codex-pty-mcp
 ```
+
+GitHub Actions runs these checks on every PR and main update. The integration
+test cleans up its sessions on both success and failure.
 
 ## License
 

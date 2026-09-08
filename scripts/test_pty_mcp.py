@@ -1,134 +1,233 @@
 #!/usr/bin/env python3
-"""Drive codex-pty-mcp over stdio like a real MCP client."""
-import json, subprocess, sys, threading, time, queue
+"""Drive the checkout's release binary over stdio like a real MCP client."""
 
-BIN = "/home/yangtim/.zcode/mcp/codex-pty-mcp/target/release/codex-pty-mcp"
+import argparse
+import json
+from pathlib import Path
+import queue
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
 
-proc = subprocess.Popen([BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE, text=True, bufsize=1)
-lines = queue.Queue()
 
-def reader():
-    for line in proc.stdout:
-        lines.put(line.strip())
-    lines.put(None)
+def payload(text):
+    """Exclude headers, which contain the original command and its markers."""
+    header, separator, body = text.partition("\n\n")
+    assert separator, f"missing output section: {header!r}"
+    return body
 
-threading.Thread(target=reader, daemon=True).start()
 
-def send(msg):
-    proc.stdin.write(json.dumps(msg) + "\n")
-    proc.stdin.flush()
+def session_id(text):
+    match = re.search(r"^session_id=(pty-\d+)$", text, re.MULTILINE)
+    assert match, f"missing session id: {text!r}"
+    return match[1]
 
-def recv(want_id, timeout=20):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+
+def result_text(response):
+    assert "error" not in response, response
+    result = response["result"]
+    assert not result.get("isError"), result
+    return "\n".join(c.get("text", "") for c in result["content"]
+                     if c.get("type") == "text")
+
+
+class Client:
+    def __init__(self, binary):
+        self.stderr = tempfile.TemporaryFile(mode="w+t")
+        self.proc = subprocess.Popen(
+            [str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=self.stderr, text=True, bufsize=1,
+        )
+        self.lines = queue.Queue()
+        self.pending = {}
+        self.next_id = 0
+        threading.Thread(target=self.reader, daemon=True).start()
+
+    def reader(self):
+        for line in self.proc.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def send(self, message):
+        self.proc.stdin.write(json.dumps(message) + "\n")
+        self.proc.stdin.flush()
+
+    def call(self, method, params):
+        self.next_id += 1
+        self.send({"jsonrpc": "2.0", "id": self.next_id,
+                   "method": method, "params": params})
+        return self.next_id
+
+    def recv(self, want_id, timeout=30):
+        if want_id in self.pending:
+            return self.pending.pop(want_id)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"no response for id={want_id}")
+            try:
+                line = self.lines.get(timeout=remaining)
+            except queue.Empty:
+                raise TimeoutError(f"no response for id={want_id}") from None
+            if line is None:
+                self.stderr.seek(0)
+                raise RuntimeError(f"server died: {self.stderr.read()[:2000]}")
+            message = json.loads(line)
+            if message.get("id") == want_id:
+                return message
+            if "id" in message:
+                # Concurrent requests can complete out of order.
+                self.pending[message["id"]] = message
+
+    def tool(self, name, arguments):
+        request = self.call("tools/call", {"name": name, "arguments": arguments})
+        return result_text(self.recv(request))
+
+    def clear_sessions(self):
+        listing = self.tool("pty_list", {})
+        for sid in re.findall(r"^\[(pty-\d+)\]", listing, re.MULTILINE):
+            self.tool("pty_kill", {"session_id": sid})
+
+    def close(self):
         try:
-            line = lines.get(timeout=0.5)
-        except queue.Empty:
-            continue
-        if line is None:
-            print("SERVER DIED:", proc.stderr.read()[:2000]); sys.exit(1)
-        msg = json.loads(line)
-        if msg.get("id") == want_id:
-            return msg
-    raise TimeoutError(f"no response for id={want_id}")
+            if self.proc.poll() is None:
+                self.clear_sessions()
+        finally:
+            self.proc.stdin.close()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            self.proc.stdout.close()
+            self.stderr.close()
 
-def call(method, params, _id=[0]):
-    _id[0] += 1
-    send({"jsonrpc": "2.0", "id": _id[0], "method": method, "params": params})
-    return _id[0]
 
-def tool(name, args, timeout=30):
-    i = call("tools/call", {"name": name, "arguments": args})
-    resp = recv(i, timeout)
-    content = resp["result"]["content"]
-    return "\n".join(c.get("text", "") for c in content if c.get("type") == "text")
+def run(client):
+    init = client.recv(client.call("initialize", {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "regression-test", "version": "1"},
+    }))
+    assert "result" in init, init
+    client.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-# handshake
-i = call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                        "clientInfo": {"name": "test", "version": "0"}})
-init = recv(i)
-print("== initialize ok:", init["result"]["serverInfo"]["name"] if "serverInfo" in init["result"] else init["result"])
-send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    tools_result = client.recv(client.call("tools/list", {}))["result"]
+    assert tools_result.get("cacheScope") in ("public", "private"), tools_result
+    assert type(tools_result.get("ttlMs")) is int and tools_result["ttlMs"] >= 0
+    tools = {tool["name"]: tool for tool in tools_result["tools"]}
+    assert len(tools) == 8, tools
+    for name in ("pty_screen", "pty_tail", "pty_list"):
+        assert tools[name]["annotations"]["readOnlyHint"] is True, tools[name]
+    print("PASS MCP handshake, tool list, cache hints, read-only annotations")
 
-# tools/list
-i = call("tools/list", {})
-tl = recv(i)
-# ZCode's client requires the SEP-2549 cache hint on tools/list results.
-assert tl["result"].get("cacheScope") in ("public", "private"), \
-    f"missing/invalid cacheScope: {tl['result'].get('cacheScope')!r}"
-assert isinstance(tl["result"].get("ttlMs"), int) and tl["result"]["ttlMs"] >= 0, \
-    f"missing/invalid ttlMs: {tl['result'].get('ttlMs')!r}"
-print("== tools:", [t["name"] for t in tl["result"]["tools"]])
+    out = client.tool("pty_spawn", {"command": "printf '你好-pty\\n'"})
+    first = session_id(out)
+    assert "你好-pty" in payload(out), out
+    assert "exited (code=0)" in out.splitlines()[0], out
+    assert "Some(" not in out.splitlines()[0], out
+    client.tool("pty_spawn", {"command": "echo second-command"})
+    for name in ("pty_screen", "pty_tail"):
+        assert "你好-pty" in payload(client.tool(name, {"session_id": first}))
+    print("PASS completed sessions stay readable after another spawn")
 
-# 1) plain command + tail
-print("=== pty_spawn: echo/ls ===")
-out = tool("pty_spawn", {"command": "echo 你好-pty && uname -r", "cols": 100, "rows": 20})
-print(out)
+    start = time.monotonic()
+    out = client.tool("pty_spawn", {"command": "echo timing-test"})
+    elapsed = time.monotonic() - start
+    assert "timing-test" in payload(out), out
+    assert elapsed < 1.2, f"settle took {elapsed:.2f}s (expected < 1.2s)"
+    print(f"PASS quick echo settles in {elapsed * 1000:.0f} ms")
 
-# 2) htop as real TUI
-print("=== pty_spawn: htop ===")
-out = tool("pty_spawn", {"command": "htop", "cols": 100, "rows": 25})
-print(out[:2200])
-sid = out.split("session_id=")[1].split("\n")[0].strip()
-print(f"---- captured session_id: {sid}")
+    # Ignore terminal hangup so the descendant survives its session leader.
+    # Immediate output resets the quiet window before the delayed write.
+    out = client.tool("pty_spawn", {
+        "command": "trap '' HUP; echo ready; (sleep 0.15; echo late-marker) &",
+    })
+    assert "late-marker" in payload(out), out
+    print("PASS delayed output after wrapper exit is captured")
 
-# 3) press F1? no — press 'q' via send (htop quits on q)
-print("=== pty_send: 'q' to htop ===")
-out = tool("pty_send", {"session_id": sid, "input": "q", "enter": False})
-print(out[:800])
+    for command, expected in (
+        ("printf '\\033(0ab\\033(Bc\\n'", "abc\n"),
+        ("printf 'a\\033$(Cb\\n'", "ab\n"),
+        ("printf 'a\\033(\\nb\\n'", "a\nb\n"),
+        ("printf 'a\\033(中文\\n'", "a中文\n"),
+    ):
+        sid = session_id(client.tool("pty_spawn", {"command": command}))
+        tail = payload(client.tool("pty_tail", {"session_id": sid}))
+        assert tail == expected, (command, tail, expected)
+        client.tool("pty_kill", {"session_id": sid})
+    print("PASS ESC intermediates, malformed sequences, UTF-8 payloads")
 
-# 4) interactive shell session + vim-less test: python REPL
-print("=== interactive python repl ===")
-out = tool("pty_spawn", {"cols": 90, "rows": 20})   # interactive bash
-sid2 = out.split("session_id=")[1].split("\n")[0].strip()
-out = tool("pty_send", {"session_id": sid2, "input": "python3 -q"})
-print(out[:600])
-out = tool("pty_send", {"session_id": sid2, "input": "21*2+sum([1,2,3])"})
-print(out[:600])
-tool("pty_kill", {"session_id": sid2})
+    out = client.tool("pty_spawn", {"command": "python3 -q"})
+    sid = session_id(out)
+    out = client.tool("pty_send", {"session_id": sid, "input": "21*2+sum([1,2,3])"})
+    assert "48" in payload(out), out
+    out = client.tool("pty_resize", {"session_id": sid, "cols": 90, "rows": 20})
+    assert "size=90x20" in out, out
+    out = client.tool("pty_ctrl", {"session_id": sid, "key": "c-d"})
+    assert "exited (code=0)" in out.splitlines()[0], out
+    client.tool("pty_kill", {"session_id": sid})
+    print("PASS interactive REPL, send, resize, control key")
 
-# 5) list
-print("=== pty_list ===")
-print(tool("pty_list", {}))
+    if shutil.which("htop"):
+        out = client.tool("pty_spawn", {"command": "htop", "cols": 100, "rows": 25})
+        sid = session_id(out)
+        # htop can initialize more slowly than the initial quiet window.
+        deadline = time.monotonic() + 5
+        while not payload(out).strip() and time.monotonic() < deadline:
+            time.sleep(0.1)
+            out = client.tool("pty_screen", {"session_id": sid})
+        assert payload(out).strip() and "running" in out.splitlines()[0], out
+        out = client.tool("pty_send", {"session_id": sid, "input": "q", "enter": False})
+        assert "exited (code=0)" in out.splitlines()[0], out
+        client.tool("pty_kill", {"session_id": sid})
+        print("PASS htop TUI rendering and quit")
+    else:
+        print("SKIP optional htop smoke test (htop not installed)")
 
-# 6) settle timing: a quick echo must settle early, not burn the 1500ms cap
-print("=== settle timing: quick echo ===")
-t0 = time.monotonic()
-out = tool("pty_spawn", {"command": "echo timing-test", "cols": 100, "rows": 20})
-elapsed = time.monotonic() - t0
-assert "timing-test" in out, f"echo output missing: {out!r}"
-assert elapsed < 1.2, f"settle too slow: {elapsed:.2f}s (expected < 1.2s)"
-print(f"---- spawn returned in {elapsed*1000:.0f}ms")
+    client.clear_sessions()
+    requests = [client.call("tools/call", {
+        "name": "pty_spawn", "arguments": {"command": "exec sleep 60"},
+    }) for _ in range(80)]
+    accepted = []
+    rejected = 0
+    for request in requests:
+        response = client.recv(request)
+        if "error" in response:
+            assert "too many sessions (max 64)" in response["error"]["message"], response
+            rejected += 1
+        else:
+            accepted.append(session_id(result_text(response)))
+    assert len(accepted) == 64 and rejected == 16, (len(accepted), rejected)
+    listing = client.tool("pty_list", {})
+    assert len(re.findall(r"^\[pty-\d+\]", listing, re.MULTILINE)) == 64, listing
+    client.tool("pty_kill", {"session_id": accepted[0]})
+    replacement = client.tool("pty_spawn", {"command": "echo replacement"})
+    assert "replacement" in payload(replacement), replacement
+    # At capacity, only the completed replacement is eligible for eviction.
+    out = client.tool("pty_spawn", {"command": "echo pressure-replacement"})
+    assert "pressure-replacement" in payload(out), out
+    print("PASS 80 concurrent spawns: 64 accepted, 16 rejected; kill and eviction free capacity")
 
-# 7) strip_ansi: 3-byte ESC sequences (e.g. ESC ( 0 charset switch) must not
-#    leave their final byte behind
-print("=== strip_ansi: 3-byte charset switch ===")
-out = tool("pty_spawn", {"command": "printf '\\033(0ab\\033(Bc\\n'", "cols": 100, "rows": 20})
-sid_ansi = out.split("session_id=")[1].split("\n")[0].strip()
-out = tool("pty_tail", {"session_id": sid_ansi, "max_bytes": 8000})
-assert "abc" in out, f"stripped output missing 'abc': {out!r}"
-assert "0abc" not in out, f"3-byte ESC sequence left residue '0abc': {out!r}"
-print(out[:400])
-tool("pty_kill", {"session_id": sid_ansi})
 
-# 8) settle must not treat child exit as drained: bash exits immediately but
-#    the backgrounded subshell still owns the PTY and writes at ~150ms
-#    (150ms leaves margin against the 300ms quiet cutoff on a loaded host)
-print("=== settle: output arriving after child exit ===")
-out = tool("pty_spawn", {"command": "(sleep 0.15; echo late-marker) &", "cols": 100, "rows": 20})
-assert "late-marker" in out, f"late post-exit output missing: {out!r}"
-print("---- late output captured")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, default=(
+        Path(__file__).resolve().parents[1] / "target/release/codex-pty-mcp"
+    ))
+    args = parser.parse_args()
+    binary = args.binary.resolve()
+    print(f"Testing {binary}")
+    client = Client(binary)
+    try:
+        run(client)
+    finally:
+        client.close()
+    print("ALL OK")
 
-# 9) strip_ansi: a malformed/truncated ESC sequence must not eat a payload
-#    byte — ESC ( followed by a newline keeps the newline
-print("=== strip_ansi: malformed ESC keeps payload ===")
-out = tool("pty_spawn", {"command": "printf 'a\\033(\\nb\\n'", "cols": 100, "rows": 20})
-sid_bad = out.split("session_id=")[1].split("\n")[0].strip()
-out = tool("pty_tail", {"session_id": sid_bad, "max_bytes": 8000})
-assert "a\nb" in out, f"malformed ESC ate the newline: {out!r}"
-print("---- payload byte preserved")
-tool("pty_kill", {"session_id": sid_bad})
 
-proc.terminate()
-print("ALL OK")
+if __name__ == "__main__":
+    main()
