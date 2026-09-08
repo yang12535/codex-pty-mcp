@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Linux PTY regression tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust tooling and TUI smoke-test dependency
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          sudo apt-get update
+          sudo apt-get install -y htop
+      - name: Check glue-layer formatting
+        run: rustfmt --edition 2024 --check src/session.rs src/handler.rs
+      - name: Test session lifecycle and escape handling
+        run: cargo test --locked
+      - name: Lint
+        run: cargo clippy --locked --all-targets
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Exercise MCP tools and concurrent session cap
+        run: python3 scripts/test_pty_mcp.py

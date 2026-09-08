@@ -90,13 +90,21 @@ ZCode（`~/.zcode/cli/config.json`）：
 
 ## 测试
 
-`scripts/test_pty_mcp.py` 直接在 stdio 上说 MCP JSON-RPC：启动 `htop`、
-截取渲染画面、退出它、驱动一个 Python REPL 并断言退出码。任何改动之后
-跑一遍就是冒烟回归：
+Rust 测试覆盖会话保留、容量释放、并发上限、PTY EOF 和转义序列。
+`scripts/test_pty_mcp.py` 默认验证当前仓库的 release 二进制，通过 stdio
+MCP JSON-RPC 检查输出正文、延迟输出、REPL、退出码及 80 次并发启动时的
+64 会话上限。安装了 `htop` 时还会验证真实 TUI 的渲染与退出。
 
 ```sh
+cargo test --locked
+cargo build --release --locked
 python3 scripts/test_pty_mcp.py
+# 也可指定待测二进制：
+python3 scripts/test_pty_mcp.py --binary /path/to/codex-pty-mcp
 ```
+
+GitHub Actions 在每个 PR 和 main 更新时运行这些检查。测试结束或失败时
+会清理本次测试创建的会话。
 
 ## 许可证
 
