@@ -52,8 +52,20 @@ impl Server {
         let stderr = Arc::new(Mutex::new(String::new()));
         let stderr_sink = Arc::clone(&stderr);
         std::thread::spawn(move || {
-            let mut captured = stderr_sink.lock().unwrap();
-            let _ = stderr_pipe.read_to_string(&mut captured);
+            // Read chunk-wise and hold the mutex only to append, so the
+            // timeout diagnostics in wait_response can never block on a
+            // server that stays alive without closing its stderr.
+            let mut stderr = stderr_pipe;
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut captured = stderr_sink.lock().unwrap();
+                        captured.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    }
+                }
+            }
         });
 
         Self {
@@ -236,6 +248,16 @@ impl Drop for Server {
     }
 }
 
+/// Drop the leading header block (everything before the first blank line) so
+/// assertions run against actual PTY output — the header embeds the original
+/// command string and would otherwise satisfy marker checks by itself.
+/// Mirrors scripts/test_pty_mcp.py's payload().
+fn payload(text: &str) -> &str {
+    text.split_once("\n\n")
+        .map(|(_, body)| body)
+        .unwrap_or_else(|| panic!("response missing output section after blank line: {text}"))
+}
+
 #[test]
 fn initialize_handshake_and_tool_catalog() {
     let mut server = Server::start();
@@ -364,8 +386,8 @@ fn tail_returns_command_output_and_exit_status() {
         "one-shot command must report exit status 0: {header}"
     );
     assert!(
-        spawned.contains("tail-marker-12345"),
-        "spawn response must carry the command output: {spawned}"
+        payload(&spawned).contains("tail-marker-12345"),
+        "spawn response body must carry the command output: {spawned}"
     );
 
     let session_id = spawned
@@ -375,8 +397,8 @@ fn tail_returns_command_output_and_exit_status() {
         .to_string();
     let tail = server.tool_text("pty_tail", json!({"session_id": session_id}));
     assert!(
-        tail.contains("tail-marker-12345"),
-        "pty_tail must carry the output: {tail}"
+        payload(&tail).contains("tail-marker-12345"),
+        "pty_tail body must carry the output: {tail}"
     );
 
     server.kill_all();
